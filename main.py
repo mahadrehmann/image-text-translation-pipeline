@@ -6,6 +6,7 @@ import numpy as np
 import cv2
 import io
 import os
+import re
 import json
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -40,33 +41,118 @@ app = FastAPI(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def translate_regions(texts: list[str]) -> list[str]:
+def _strip_fences(raw: str) -> str:
+    """Removes markdown code fences (```json ... ```) from a Gemini response."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        # Drop the opening fence line
+        raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+        # Drop the closing fence
+        if raw.rstrip().endswith("```"):
+            raw = raw.rstrip()[:-3]
+    return raw.strip()
+
+
+def translate_regions(texts: list[str]) -> tuple[list[str], list[float]]:
     """
-    Sends all detected text regions to Gemini in a single call.
-    Asks for a JSON array of translations in the same order.
-    Returns a list of translated strings (falls back to originals on failure).
+    Sends all detected line texts to Gemini in a single call.
+
+    Asks Gemini to:
+      - Translate each text to English
+      - Self-evaluate translation quality with a confidence_score (1–10)
+
+    Returns
+    -------
+    translations : list[str]   — translated strings, one per input
+    scores       : list[float] — confidence scores 1–10, one per input
+
+    Both lists are the same length as `texts`.  On any parsing failure the
+    original text and score 0.0 are used as safe fallbacks so the rendering
+    pipeline never breaks.
     """
+    n = len(texts)
     numbered = "\n".join(f'{i + 1}. "{t}"' for i, t in enumerate(texts))
+
     prompt = (
-        "You are a professional translator.\n"
-        "Translate each of the following texts to English.\n"
-        "Return ONLY a valid JSON array of translated strings in the SAME ORDER.\n"
-        "Example output: [\"Hello\", \"World\"]\n\n"
+        "You are a professional translator and quality evaluator.\n"
+        "For each numbered text below:\n"
+        "  1. Translate it accurately to English.\n"
+        "  2. Rate your own translation quality on a scale of 1 (poor) to 10 (perfect),\n"
+        "     considering accuracy, fluency, and preservation of meaning.\n"
+        "\n"
+        "Return ONLY a valid JSON array — one object per input — in the SAME ORDER.\n"
+        "Each object must have exactly these two keys:\n"
+        '  \'translation\': string  — the English translation\n'
+        '  \'confidence_score\': number  — your quality rating (1–10)\n'
+        "\n"
+        "Example output for 2 inputs:\n"
+        '[{"translation": "Hello world", "confidence_score": 9},\n'
+        ' {"translation": "Special offer", "confidence_score": 8}]\n\n'
         f"Texts to translate:\n{numbered}"
     )
-    response = gemini_model.generate_content(prompt)
-    raw = response.text.strip()
-    print (numbered, response)
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
 
-    translations = json.loads(raw.strip())
-    if not isinstance(translations, list) or len(translations) != len(texts):
-        raise ValueError("Gemini returned unexpected translation format.")
-    return [str(t) for t in translations]
+    # ── Fallback defaults (used if anything goes wrong) ────────────────────────
+    fallback_translations = list(texts)
+    fallback_scores       = [0.0] * n
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw      = _strip_fences(response.text)
+
+        # ── Layer 1: parse full JSON array ─────────────────────────────────────
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try to extract the first [...] block in case there's extra prose
+            match = re.search(r"\[.*?\]", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+            else:
+                raise ValueError("No JSON array found in response")
+
+        if not isinstance(parsed, list):
+            raise ValueError("Parsed JSON is not a list")
+
+        # ── Layer 2: extract fields item-by-item with per-item fallback ────────
+        translations: list[str]   = []
+        scores:       list[float] = []
+
+        for i, item in enumerate(parsed[:n]):
+            orig = texts[i] if i < n else ""
+
+            if isinstance(item, dict):
+                # translation field
+                t = item.get("translation") or item.get("translated_text") or orig
+                translations.append(str(t).strip() or orig)
+
+                # confidence_score field
+                raw_score = item.get("confidence_score") or item.get("confidence") or 0
+                try:
+                    score = float(raw_score)
+                    score = max(1.0, min(10.0, score))  # clamp to [1, 10]
+                except (TypeError, ValueError):
+                    score = 0.0
+                scores.append(score)
+
+            elif isinstance(item, str):
+                # Gemini returned plain strings instead of objects — accept gracefully
+                translations.append(item.strip() or orig)
+                scores.append(0.0)
+            else:
+                translations.append(orig)
+                scores.append(0.0)
+
+        # Pad if Gemini returned fewer items than expected
+        while len(translations) < n:
+            translations.append(texts[len(translations)])
+            scores.append(0.0)
+
+        print(f"[TRANSLATE] {n} lines | scores: {scores}")
+        return translations, scores
+
+    except Exception as e:
+        print(f"[WARN] translate_regions failed ({e}), using originals with score 0")
+        return fallback_translations, fallback_scores
 
 
 def inpaint_regions(img_bgr: np.ndarray, bboxes: list) -> np.ndarray:
@@ -109,6 +195,52 @@ def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFon
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
+
+
+def get_text_color_kmeans(region_rgb: np.ndarray) -> tuple[int, int, int]:
+    """
+    Applies K-means (k=2) to the pixels inside a bounding-box crop to find
+    the dominant text color.
+
+    Strategy:
+    - The two clusters represent background and text.
+    - The SMALLER cluster (fewer pixels) is assumed to be the text color,
+      since text covers less area than the background.
+    - Falls back to black or white (brightness-based) if K-means fails.
+
+    Parameters
+    ----------
+    region_rgb : H x W x 3 uint8 numpy array (RGB)
+
+    Returns
+    -------
+    (R, G, B) tuple for the text color.
+    """
+    try:
+        pixels = region_rgb.reshape(-1, 3).astype(np.float32)
+
+        if len(pixels) < 2:
+            raise ValueError("Region too small")
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, centers = cv2.kmeans(
+            pixels, 2, None, criteria,
+            attempts=3, flags=cv2.KMEANS_RANDOM_CENTERS
+        )
+
+        labels = labels.flatten()
+        count0 = int(np.sum(labels == 0))
+        count1 = int(np.sum(labels == 1))
+
+        # Text cluster = the minority cluster
+        text_cluster = 0 if count0 < count1 else 1
+        color = centers[text_cluster].astype(int)
+        return (int(color[0]), int(color[1]), int(color[2]))
+
+    except Exception:
+        # Fallback: black on light backgrounds, white on dark
+        brightness = float(region_rgb.mean())
+        return (0, 0, 0) if brightness > 128 else (255, 255, 255)
 
 
 def estimate_font_size(box_h: int, scale: float = 0.72) -> int:
@@ -285,14 +417,16 @@ def draw_translated_lines(
     pil_img: Image.Image,
     merged_lines: list[dict],
     translations: list[str],
+    original_img_array: np.ndarray,
 ) -> Image.Image:
     """
     Renders each translated line string into the line's merged bounding box.
     - Font sizes are estimated from bbox heights then clustered to eliminate
       EasyOCR jitter — lines of similar original size render identically.
-    - Paragraph lines (close vertical neighbors) are left-aligned.
+    - Paragraph lines (close x_min neighbors) are left-aligned.
     - Isolated lines (headlines, labels) are center-aligned.
-    - Color is black or white based on background brightness.
+    - Text color is detected via K-means on the ORIGINAL (pre-inpaint) crop
+      so the real text color is used, not the inpainted background.
     """
     draw = ImageDraw.Draw(pil_img)
 
@@ -331,69 +465,40 @@ def draw_translated_lines(
 
         y = y_min + (box_h - th) // 2  # always vertically centered
 
-        # Black or white text based on background brightness
-        region = np.array(pil_img.crop((x_min, y_min, x_max, y_max)))
-        text_color = (0, 0, 0) if region.mean() > 128 else (255, 255, 255)
+        # K-means color detection on the ORIGINAL image crop (before inpainting)
+        region = original_img_array[y_min:y_max, x_min:x_max]
+        text_color = get_text_color_kmeans(region)
 
         draw.text((x, y), translated, font=font, fill=text_color)
 
     return pil_img
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
+# ── Shared pipeline ───────────────────────────────────────────────────────────
 
-@app.post(
-    "/process-image",
-    responses={200: {"content": {"image/png": {}}}},
-    response_class=StreamingResponse,
-)
-async def process_image(image: UploadFile = File(...)):
+ALLOWED_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
+INPUT_DIR     = "images"
+OUTPUT_DIR    = "reconstructed-images"
+
+
+def run_pipeline(image_bytes: bytes) -> Image.Image:
     """
-    Full pipeline:
-    1. Validate image
-    2. EasyOCR — detect text regions + bounding boxes
-    3. Gemini 2.5 Flash — translate all regions in one call
-    4. cv2 TELEA inpainting — erase original text
-    5. Pillow — render translated text back in the same boxes
-    6. Return the modified image as PNG
+    Runs the full OCR → translate → inpaint → render pipeline on raw image
+    bytes.  Returns the reconstructed PIL Image.
+
+    Raises exceptions on failure so callers can handle them appropriately.
     """
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_array = np.array(pil_image)
+    img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    # ── 1. Validate ───────────────────────────────────────────────────────────
-    ALLOWED_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
-    if image.content_type not in ALLOWED_TYPES:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Unsupported file type '{image.content_type}'. Allowed: {', '.join(ALLOWED_TYPES)}"},
-        )
-
-    # ── 2. Decode image ───────────────────────────────────────────────────────
-    try:
-        image_bytes = await image.read()
-        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(pil_image)
-        # OpenCV uses BGR
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        return JSONResponse(status_code=422, content={"error": f"Failed to decode image: {e}"})
-
-    # ── 3. OCR ────────────────────────────────────────────────────────────────
-    try:
-        ocr_results = reader.readtext(img_array, detail=1)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"OCR failed: {e}"})
-
+    # OCR
+    ocr_results = reader.readtext(img_array, detail=1)
     if not ocr_results:
-        # Nothing detected — return original image unchanged
-        buf = io.BytesIO()
-        pil_image.save(buf, format="PNG")
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="image/png",
-                                 headers={"X-Warning": "No text detected in image"})
+        return pil_image  # nothing to do — return original
 
-    # ── Parse raw OCR chunks ──────────────────────────────────────────────────
-    raw_bboxes = []   # 4-corner polygons for every chunk (used for inpaint mask)
-    detections = []   # per-chunk structured dicts
-
+    # Parse chunks
+    raw_bboxes, detections = [], []
     for bbox, text, confidence in ocr_results:
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
@@ -407,42 +512,131 @@ async def process_image(image: UploadFile = File(...)):
             },
         })
 
-    # ── Merge chunks into whole lines ─────────────────────────────────────────
+    # Merge chunks into lines
     merged_lines = merge_detections_into_lines(detections)
     line_texts   = [ln["text"] for ln in merged_lines]
 
-    # ── 4. Translate one string per merged line ───────────────────────────────
+    # Translate
     try:
-        translations = translate_regions(line_texts)
+        translations, confidence_scores = translate_regions(line_texts)
     except Exception as e:
-        translations = line_texts
         print(f"[WARN] Translation failed, using originals: {e}")
+        translations     = line_texts
+        confidence_scores = [0.0] * len(line_texts)
 
-    # ── 5. Inpaint ALL original chunk bboxes ─────────────────────────────────
+    # Inpaint
+    inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
+
+    # Render translated text
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+    result_pil    = Image.fromarray(inpainted_rgb)
+    result_pil    = draw_translated_lines(result_pil, merged_lines, translations, img_array)
+
+    return result_pil
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/process-image",
+    responses={200: {"content": {"image/png": {}}}},
+    response_class=StreamingResponse,
+)
+async def process_image(image: UploadFile = File(...)):
+    """
+    Single-image pipeline: upload one image, receive the reconstructed PNG.
+
+    Steps:
+    1. Validate image type
+    2. EasyOCR — detect text regions + bounding boxes
+    3. Gemini 2.5 Flash — translate all lines in one call
+    4. cv2 TELEA inpainting — erase original text
+    5. K-means color detection + Pillow — render translated text
+    6. Return the modified image as PNG
+    """
+    if image.content_type not in ALLOWED_TYPES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unsupported file type '{image.content_type}'. Allowed: {', '.join(ALLOWED_TYPES)}"},
+        )
+
     try:
-        inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
+        image_bytes = await image.read()
+        result_pil  = run_pipeline(image_bytes)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Inpainting failed: {e}"})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # ── 6. Draw one translated string per merged line ─────────────────────────
-    try:
-        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-        result_pil = Image.fromarray(inpainted_rgb)
-        result_pil = draw_translated_lines(result_pil, merged_lines, translations)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Text rendering failed: {e}"})
-
-    # ── 7. Encode and return ──────────────────────────────────────────────────
     buf = io.BytesIO()
     result_pil.save(buf, format="PNG")
     buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
 
-    return StreamingResponse(
-        buf,
-        media_type="image/png",
-        headers={
-            "X-Extracted-Text": " | ".join(line_texts),
-            "X-Translated-Text": " | ".join(translations),
-            "X-Num-Lines": str(len(merged_lines)),
-        },
-    )
+
+@app.post("/batch-process")
+async def batch_process():
+    """
+    Batch pipeline: reads every image from the `images/` folder, runs the
+    full pipeline on each one, and saves the results to `reconstructed-images/`.
+
+    Returns a JSON summary with per-file status (success / error).
+
+    No file upload needed — images must already be present in the `images/`
+    directory relative to where the server is running.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    if not os.path.isdir(INPUT_DIR):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Input directory '{INPUT_DIR}' not found."},
+        )
+
+    # Collect supported files
+    candidates = [
+        f for f in os.listdir(INPUT_DIR)
+        if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg", ".webp")
+    ]
+
+    if not candidates:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No supported images found in '{INPUT_DIR}'."},
+        )
+
+    results = []
+    for filename in sorted(candidates):
+        input_path  = os.path.join(INPUT_DIR, filename)
+        stem        = os.path.splitext(filename)[0]
+        output_path = os.path.join(OUTPUT_DIR, f"{stem}.png")
+
+        try:
+            with open(input_path, "rb") as f:
+                image_bytes = f.read()
+
+            result_pil = run_pipeline(image_bytes)
+            result_pil.save(output_path, format="PNG")
+
+            results.append({
+                "file": filename,
+                "status": "success",
+                "output": output_path,
+            })
+            print(f"[BATCH] ✓ {filename} → {output_path}")
+
+        except Exception as e:
+            results.append({
+                "file": filename,
+                "status": "error",
+                "error": str(e),
+            })
+            print(f"[BATCH] ✗ {filename}: {e}")
+
+    success_count = sum(1 for r in results if r["status"] == "success")
+    return {
+        "total": len(results),
+        "succeeded": success_count,
+        "failed": len(results) - success_count,
+        "output_dir": OUTPUT_DIR,
+        "results": results,
+    }
+
