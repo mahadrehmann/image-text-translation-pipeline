@@ -388,60 +388,31 @@ def draw_translated_lines(
     return pil_img
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
+# ── Shared pipeline ───────────────────────────────────────────────────────────
 
-@app.post(
-    "/process-image",
-    responses={200: {"content": {"image/png": {}}}},
-    response_class=StreamingResponse,
-)
-async def process_image(image: UploadFile = File(...)):
+ALLOWED_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
+INPUT_DIR     = "images"
+OUTPUT_DIR    = "reconstructed-images"
+
+
+def run_pipeline(image_bytes: bytes) -> Image.Image:
     """
-    Full pipeline:
-    1. Validate image
-    2. EasyOCR — detect text regions + bounding boxes
-    3. Gemini 2.5 Flash — translate all regions in one call
-    4. cv2 TELEA inpainting — erase original text
-    5. Pillow — render translated text back in the same boxes
-    6. Return the modified image as PNG
+    Runs the full OCR → translate → inpaint → render pipeline on raw image
+    bytes.  Returns the reconstructed PIL Image.
+
+    Raises exceptions on failure so callers can handle them appropriately.
     """
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_array = np.array(pil_image)
+    img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    # ── 1. Validate ───────────────────────────────────────────────────────────
-    ALLOWED_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
-    if image.content_type not in ALLOWED_TYPES:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Unsupported file type '{image.content_type}'. Allowed: {', '.join(ALLOWED_TYPES)}"},
-        )
-
-    # ── 2. Decode image ───────────────────────────────────────────────────────
-    try:
-        image_bytes = await image.read()
-        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(pil_image)
-        # OpenCV uses BGR
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        return JSONResponse(status_code=422, content={"error": f"Failed to decode image: {e}"})
-
-    # ── 3. OCR ────────────────────────────────────────────────────────────────
-    try:
-        ocr_results = reader.readtext(img_array, detail=1)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"OCR failed: {e}"})
-
+    # OCR
+    ocr_results = reader.readtext(img_array, detail=1)
     if not ocr_results:
-        # Nothing detected — return original image unchanged
-        buf = io.BytesIO()
-        pil_image.save(buf, format="PNG")
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="image/png",
-                                 headers={"X-Warning": "No text detected in image"})
+        return pil_image  # nothing to do — return original
 
-    # ── Parse raw OCR chunks ──────────────────────────────────────────────────
-    raw_bboxes = []   # 4-corner polygons for every chunk (used for inpaint mask)
-    detections = []   # per-chunk structured dicts
-
+    # Parse chunks
+    raw_bboxes, detections = [], []
     for bbox, text, confidence in ocr_results:
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
@@ -455,42 +426,130 @@ async def process_image(image: UploadFile = File(...)):
             },
         })
 
-    # ── Merge chunks into whole lines ─────────────────────────────────────────
+    # Merge chunks into lines
     merged_lines = merge_detections_into_lines(detections)
     line_texts   = [ln["text"] for ln in merged_lines]
 
-    # ── 4. Translate one string per merged line ───────────────────────────────
+    # Translate
     try:
         translations = translate_regions(line_texts)
     except Exception as e:
-        translations = line_texts
         print(f"[WARN] Translation failed, using originals: {e}")
+        translations = line_texts
 
-    # ── 5. Inpaint ALL original chunk bboxes ─────────────────────────────────
+    # Inpaint
+    inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
+
+    # Render translated text
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+    result_pil    = Image.fromarray(inpainted_rgb)
+    result_pil    = draw_translated_lines(result_pil, merged_lines, translations, img_array)
+
+    return result_pil
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/process-image",
+    responses={200: {"content": {"image/png": {}}}},
+    response_class=StreamingResponse,
+)
+async def process_image(image: UploadFile = File(...)):
+    """
+    Single-image pipeline: upload one image, receive the reconstructed PNG.
+
+    Steps:
+    1. Validate image type
+    2. EasyOCR — detect text regions + bounding boxes
+    3. Gemini 2.5 Flash — translate all lines in one call
+    4. cv2 TELEA inpainting — erase original text
+    5. K-means color detection + Pillow — render translated text
+    6. Return the modified image as PNG
+    """
+    if image.content_type not in ALLOWED_TYPES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unsupported file type '{image.content_type}'. Allowed: {', '.join(ALLOWED_TYPES)}"},
+        )
+
     try:
-        inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
+        image_bytes = await image.read()
+        result_pil  = run_pipeline(image_bytes)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Inpainting failed: {e}"})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # ── 6. Draw one translated string per merged line ─────────────────────────
-    try:
-        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-        result_pil = Image.fromarray(inpainted_rgb)
-        result_pil = draw_translated_lines(result_pil, merged_lines, translations, img_array)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Text rendering failed: {e}"})
-
-    # ── 7. Encode and return ──────────────────────────────────────────────────
     buf = io.BytesIO()
     result_pil.save(buf, format="PNG")
     buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
 
-    return StreamingResponse(
-        buf,
-        media_type="image/png",
-        headers={
-            "X-Extracted-Text": " | ".join(line_texts),
-            "X-Translated-Text": " | ".join(translations),
-            "X-Num-Lines": str(len(merged_lines)),
-        },
-    )
+
+@app.post("/batch-process")
+async def batch_process():
+    """
+    Batch pipeline: reads every image from the `images/` folder, runs the
+    full pipeline on each one, and saves the results to `reconstructed-images/`.
+
+    Returns a JSON summary with per-file status (success / error).
+
+    No file upload needed — images must already be present in the `images/`
+    directory relative to where the server is running.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    if not os.path.isdir(INPUT_DIR):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Input directory '{INPUT_DIR}' not found."},
+        )
+
+    # Collect supported files
+    candidates = [
+        f for f in os.listdir(INPUT_DIR)
+        if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg", ".webp")
+    ]
+
+    if not candidates:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No supported images found in '{INPUT_DIR}'."},
+        )
+
+    results = []
+    for filename in sorted(candidates):
+        input_path  = os.path.join(INPUT_DIR, filename)
+        stem        = os.path.splitext(filename)[0]
+        output_path = os.path.join(OUTPUT_DIR, f"{stem}.png")
+
+        try:
+            with open(input_path, "rb") as f:
+                image_bytes = f.read()
+
+            result_pil = run_pipeline(image_bytes)
+            result_pil.save(output_path, format="PNG")
+
+            results.append({
+                "file": filename,
+                "status": "success",
+                "output": output_path,
+            })
+            print(f"[BATCH] ✓ {filename} → {output_path}")
+
+        except Exception as e:
+            results.append({
+                "file": filename,
+                "status": "error",
+                "error": str(e),
+            })
+            print(f"[BATCH] ✗ {filename}: {e}")
+
+    success_count = sum(1 for r in results if r["status"] == "success")
+    return {
+        "total": len(results),
+        "succeeded": success_count,
+        "failed": len(results) - success_count,
+        "output_dir": OUTPUT_DIR,
+        "results": results,
+    }
+
