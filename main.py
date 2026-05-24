@@ -6,6 +6,7 @@ import numpy as np
 import cv2
 import io
 import os
+import re
 import json
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -40,33 +41,118 @@ app = FastAPI(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def translate_regions(texts: list[str]) -> list[str]:
+def _strip_fences(raw: str) -> str:
+    """Removes markdown code fences (```json ... ```) from a Gemini response."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        # Drop the opening fence line
+        raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+        # Drop the closing fence
+        if raw.rstrip().endswith("```"):
+            raw = raw.rstrip()[:-3]
+    return raw.strip()
+
+
+def translate_regions(texts: list[str]) -> tuple[list[str], list[float]]:
     """
-    Sends all detected text regions to Gemini in a single call.
-    Asks for a JSON array of translations in the same order.
-    Returns a list of translated strings (falls back to originals on failure).
+    Sends all detected line texts to Gemini in a single call.
+
+    Asks Gemini to:
+      - Translate each text to English
+      - Self-evaluate translation quality with a confidence_score (1–10)
+
+    Returns
+    -------
+    translations : list[str]   — translated strings, one per input
+    scores       : list[float] — confidence scores 1–10, one per input
+
+    Both lists are the same length as `texts`.  On any parsing failure the
+    original text and score 0.0 are used as safe fallbacks so the rendering
+    pipeline never breaks.
     """
+    n = len(texts)
     numbered = "\n".join(f'{i + 1}. "{t}"' for i, t in enumerate(texts))
+
     prompt = (
-        "You are a professional translator.\n"
-        "Translate each of the following texts to English.\n"
-        "Return ONLY a valid JSON array of translated strings in the SAME ORDER.\n"
-        "Example output: [\"Hello\", \"World\"]\n\n"
+        "You are a professional translator and quality evaluator.\n"
+        "For each numbered text below:\n"
+        "  1. Translate it accurately to English.\n"
+        "  2. Rate your own translation quality on a scale of 1 (poor) to 10 (perfect),\n"
+        "     considering accuracy, fluency, and preservation of meaning.\n"
+        "\n"
+        "Return ONLY a valid JSON array — one object per input — in the SAME ORDER.\n"
+        "Each object must have exactly these two keys:\n"
+        '  \'translation\': string  — the English translation\n'
+        '  \'confidence_score\': number  — your quality rating (1–10)\n'
+        "\n"
+        "Example output for 2 inputs:\n"
+        '[{"translation": "Hello world", "confidence_score": 9},\n'
+        ' {"translation": "Special offer", "confidence_score": 8}]\n\n'
         f"Texts to translate:\n{numbered}"
     )
-    response = gemini_model.generate_content(prompt)
-    raw = response.text.strip()
-    print (numbered, response)
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
 
-    translations = json.loads(raw.strip())
-    if not isinstance(translations, list) or len(translations) != len(texts):
-        raise ValueError("Gemini returned unexpected translation format.")
-    return [str(t) for t in translations]
+    # ── Fallback defaults (used if anything goes wrong) ────────────────────────
+    fallback_translations = list(texts)
+    fallback_scores       = [0.0] * n
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw      = _strip_fences(response.text)
+
+        # ── Layer 1: parse full JSON array ─────────────────────────────────────
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try to extract the first [...] block in case there's extra prose
+            match = re.search(r"\[.*?\]", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+            else:
+                raise ValueError("No JSON array found in response")
+
+        if not isinstance(parsed, list):
+            raise ValueError("Parsed JSON is not a list")
+
+        # ── Layer 2: extract fields item-by-item with per-item fallback ────────
+        translations: list[str]   = []
+        scores:       list[float] = []
+
+        for i, item in enumerate(parsed[:n]):
+            orig = texts[i] if i < n else ""
+
+            if isinstance(item, dict):
+                # translation field
+                t = item.get("translation") or item.get("translated_text") or orig
+                translations.append(str(t).strip() or orig)
+
+                # confidence_score field
+                raw_score = item.get("confidence_score") or item.get("confidence") or 0
+                try:
+                    score = float(raw_score)
+                    score = max(1.0, min(10.0, score))  # clamp to [1, 10]
+                except (TypeError, ValueError):
+                    score = 0.0
+                scores.append(score)
+
+            elif isinstance(item, str):
+                # Gemini returned plain strings instead of objects — accept gracefully
+                translations.append(item.strip() or orig)
+                scores.append(0.0)
+            else:
+                translations.append(orig)
+                scores.append(0.0)
+
+        # Pad if Gemini returned fewer items than expected
+        while len(translations) < n:
+            translations.append(texts[len(translations)])
+            scores.append(0.0)
+
+        print(f"[TRANSLATE] {n} lines | scores: {scores}")
+        return translations, scores
+
+    except Exception as e:
+        print(f"[WARN] translate_regions failed ({e}), using originals with score 0")
+        return fallback_translations, fallback_scores
 
 
 def inpaint_regions(img_bgr: np.ndarray, bboxes: list) -> np.ndarray:
@@ -432,10 +518,11 @@ def run_pipeline(image_bytes: bytes) -> Image.Image:
 
     # Translate
     try:
-        translations = translate_regions(line_texts)
+        translations, confidence_scores = translate_regions(line_texts)
     except Exception as e:
         print(f"[WARN] Translation failed, using originals: {e}")
-        translations = line_texts
+        translations     = line_texts
+        confidence_scores = [0.0] * len(line_texts)
 
     # Inpaint
     inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
