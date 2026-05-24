@@ -56,7 +56,7 @@ def translate_regions(texts: list[str]) -> list[str]:
     )
     response = gemini_model.generate_content(prompt)
     raw = response.text.strip()
-
+    print (numbered, response)
     # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -87,74 +87,202 @@ def inpaint_regions(img_bgr: np.ndarray, bboxes: list) -> np.ndarray:
     return inpainted
 
 
-def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Tries common system fonts; falls back to PIL default."""
-    candidates = [
+def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """
+    Loads a system font at the given size.
+    Prefers regular weight; falls back to bold, then PIL default.
+    """
+    regular_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    bold_candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     ]
+    candidates = bold_candidates + regular_candidates if bold else regular_candidates + bold_candidates
     for path in candidates:
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
-def fit_text_in_box(draw: ImageDraw.ImageDraw, text: str, box_w: int, box_h: int) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]:
+def estimate_font_size(box_h: int, scale: float = 0.72) -> int:
     """
-    Binary-searches for the largest font size where `text` fits inside
-    the given box dimensions. Returns (font, font_size).
+    Estimates the original font size from the bounding-box height.
+    The scale factor (default 0.72) accounts for line-height / descender
+    padding that EasyOCR includes in the bbox.
+    Returns a size clamped to a sensible minimum of 8px.
     """
-    lo, hi = 8, max(box_h, 10)
-    best_size = lo
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        font = get_font(mid)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        if tw <= box_w and th <= box_h:
-            best_size = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return get_font(best_size), best_size
+    return max(8, int(box_h * scale))
 
 
-def draw_translated_text(
-    pil_img: Image.Image,
+def cluster_font_sizes(sizes: list[int], tolerance: float = 0.25) -> list[int]:
+    """
+    Snaps a list of font sizes to cluster medians so that lines whose
+    original text was the same visual size don't render at slightly
+    different sizes due to EasyOCR bbox height jitter.
+
+    Two sizes belong to the same cluster when they are within `tolerance`
+    (default 25%) of the smaller of the two.
+
+    Returns a new list of the same length with each size replaced by
+    the integer median of its cluster.
+    """
+    if not sizes:
+        return sizes
+
+    # Build clusters greedily on sorted sizes
+    indexed = sorted(enumerate(sizes), key=lambda x: x[1])
+    clusters: list[list[tuple[int, int]]] = []  # list of [(original_idx, size), ...]
+
+    for orig_idx, sz in indexed:
+        placed = False
+        for cluster in clusters:
+            rep = cluster[0][1]  # representative = first (smallest) size in cluster
+            if rep > 0 and abs(sz - rep) / rep <= tolerance:
+                cluster.append((orig_idx, sz))
+                placed = True
+                break
+        if not placed:
+            clusters.append([(orig_idx, sz)])
+
+    # Compute median of each cluster and map back to original positions
+    result = [0] * len(sizes)
+    for cluster in clusters:
+        cluster_sizes = sorted(s for _, s in cluster)
+        median = cluster_sizes[len(cluster_sizes) // 2]
+        for orig_idx, _ in cluster:
+            result[orig_idx] = median
+
+    return result
+
+
+def merge_detections_into_lines(
     detections: list[dict],
+    overlap_threshold: float = 0.5,
+) -> list[dict]:
+    """
+    Groups EasyOCR chunk-level detections into whole-line detections.
+
+    Two chunks belong to the same line when their vertical ranges overlap
+    by at least `overlap_threshold` of the shorter chunk's height.
+
+    Within each line, chunks are sorted left-to-right and their texts are
+    joined with a space.  The merged bounding box spans the full horizontal
+    extent of the line.
+
+    Returns a list of merged line dicts:
+        {
+            "text": str,                  # space-joined chunk texts
+            "chunk_indices": list[int],   # original detection indices in the line
+            "bounding_box": {x_min, y_min, x_max, y_max},
+        }
+    """
+    n = len(detections)
+    if n == 0:
+        return []
+
+    order = sorted(range(n), key=lambda i: detections[i]["bounding_box"]["y_min"])
+    used = [False] * n
+    merged_lines: list[dict] = []
+
+    for i in order:
+        if used[i]:
+            continue
+        group = [i]
+        used[i] = True
+        bb_i = detections[i]["bounding_box"]
+        y_min_i, y_max_i = bb_i["y_min"], bb_i["y_max"]
+
+        for j in order:
+            if used[j]:
+                continue
+            bb_j = detections[j]["bounding_box"]
+            y_min_j, y_max_j = bb_j["y_min"], bb_j["y_max"]
+
+            overlap   = max(0, min(y_max_i, y_max_j) - max(y_min_i, y_min_j))
+            shorter_h = min(y_max_i - y_min_i, y_max_j - y_min_j)
+            if shorter_h > 0 and overlap / shorter_h >= overlap_threshold:
+                group.append(j)
+                used[j] = True
+
+        # Sort chunks left-to-right within the line
+        group.sort(key=lambda i: detections[i]["bounding_box"]["x_min"])
+
+        # Build merged bounding box covering all chunks in this line
+        x_mins = [detections[i]["bounding_box"]["x_min"] for i in group]
+        y_mins = [detections[i]["bounding_box"]["y_min"] for i in group]
+        x_maxs = [detections[i]["bounding_box"]["x_max"] for i in group]
+        y_maxs = [detections[i]["bounding_box"]["y_max"] for i in group]
+
+        merged_lines.append({
+            "text": " ".join(detections[i]["text"] for i in group),
+            "chunk_indices": group,
+            "bounding_box": {
+                "x_min": min(x_mins),
+                "y_min": min(y_mins),
+                "x_max": max(x_maxs),
+                "y_max": max(y_maxs),
+            },
+        })
+
+    # Sort lines top-to-bottom
+    merged_lines.sort(key=lambda ln: ln["bounding_box"]["y_min"])
+    return merged_lines
+
+
+def draw_translated_lines(
+    pil_img: Image.Image,
+    merged_lines: list[dict],
     translations: list[str],
 ) -> Image.Image:
     """
-    Draws each translated string centered inside its original bounding box.
-    Auto-sizes the font to fill the box, picks black or white text for contrast.
+    Renders each translated line string into the line's merged bounding box.
+    - Font sizes are estimated from bbox heights then clustered to eliminate
+      EasyOCR jitter — lines of similar original size render identically.
+    - Text is left-aligned with a small horizontal padding.
+    - Color is black or white based on background brightness.
     """
     draw = ImageDraw.Draw(pil_img)
 
-    for det, translated in zip(detections, translations):
-        bb = det["bounding_box"]
+    # Pre-compute and cluster font sizes across all lines
+    box_heights = [
+        ln["bounding_box"]["y_max"] - ln["bounding_box"]["y_min"]
+        for ln in merged_lines
+    ]
+    raw_sizes    = [estimate_font_size(h) for h in box_heights]
+    stable_sizes = cluster_font_sizes(raw_sizes)
+
+    for line, translated, font_size in zip(merged_lines, translations, stable_sizes):
+        if not translated.strip():
+            continue
+
+        bb = line["bounding_box"]
         x_min, y_min = bb["x_min"], bb["y_min"]
         x_max, y_max = bb["x_max"], bb["y_max"]
         box_w = x_max - x_min
         box_h = y_max - y_min
 
-        if box_w < 5 or box_h < 5 or not translated.strip():
+        if box_w < 5 or box_h < 5:
             continue
 
-        font, _ = fit_text_in_box(draw, translated, box_w, box_h)
+        font = get_font(font_size)
 
-        # Center text in the box
-        bbox = draw.textbbox((0, 0), translated, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = x_min + (box_w - tw) // 2
+        # Vertically center; left-align with small padding
+        tbbox = draw.textbbox((0, 0), translated, font=font)
+        tw, th = tbbox[2] - tbbox[0], tbbox[3] - tbbox[1]
+        padding = max(2, int(box_h * 0.05))
+        x = x_min + padding
         y = y_min + (box_h - th) // 2
 
-        # Pick text color (black/white) based on background brightness
+        # Black or white text based on background brightness
         region = np.array(pil_img.crop((x_min, y_min, x_max, y_max)))
-        avg_brightness = region.mean()
-        text_color = (0, 0, 0) if avg_brightness > 128 else (255, 255, 255)
+        text_color = (0, 0, 0) if region.mean() > 128 else (255, 255, 255)
 
         draw.text((x, y), translated, font=font, fill=text_color)
 
@@ -211,10 +339,9 @@ async def process_image(image: UploadFile = File(...)):
         return StreamingResponse(buf, media_type="image/png",
                                  headers={"X-Warning": "No text detected in image"})
 
-    # Parse OCR output
-    raw_bboxes = []     # 4-corner polygons (for inpainting mask)
-    detections = []     # structured dicts (for drawing)
-    texts = []          # plain strings (for translation)
+    # ── Parse raw OCR chunks ──────────────────────────────────────────────────
+    raw_bboxes = []   # 4-corner polygons for every chunk (used for inpaint mask)
+    detections = []   # per-chunk structured dicts
 
     for bbox, text, confidence in ocr_results:
         xs = [p[0] for p in bbox]
@@ -228,27 +355,29 @@ async def process_image(image: UploadFile = File(...)):
                 "x_max": int(max(xs)), "y_max": int(max(ys)),
             },
         })
-        texts.append(text)
 
-    # ── 4. Translate ──────────────────────────────────────────────────────────
+    # ── Merge chunks into whole lines ─────────────────────────────────────────
+    merged_lines = merge_detections_into_lines(detections)
+    line_texts   = [ln["text"] for ln in merged_lines]
+
+    # ── 4. Translate one string per merged line ───────────────────────────────
     try:
-        translations = translate_regions(texts)
+        translations = translate_regions(line_texts)
     except Exception as e:
-        # Non-fatal: fall back to original texts
-        translations = texts
+        translations = line_texts
         print(f"[WARN] Translation failed, using originals: {e}")
 
-    # ── 5. Inpaint original text ──────────────────────────────────────────────
+    # ── 5. Inpaint ALL original chunk bboxes ─────────────────────────────────
     try:
         inpainted_bgr = inpaint_regions(img_bgr, raw_bboxes)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Inpainting failed: {e}"})
 
-    # ── 6. Draw translated text ───────────────────────────────────────────────
+    # ── 6. Draw one translated string per merged line ─────────────────────────
     try:
         inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
         result_pil = Image.fromarray(inpainted_rgb)
-        result_pil = draw_translated_text(result_pil, detections, translations)
+        result_pil = draw_translated_lines(result_pil, merged_lines, translations)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Text rendering failed: {e}"})
 
@@ -261,8 +390,8 @@ async def process_image(image: UploadFile = File(...)):
         buf,
         media_type="image/png",
         headers={
-            "X-Extracted-Text": "; ".join(texts),
-            "X-Translated-Text": "; ".join(translations),
-            "X-Num-Detections": str(len(detections)),
+            "X-Extracted-Text": " | ".join(line_texts),
+            "X-Translated-Text": " | ".join(translations),
+            "X-Num-Lines": str(len(merged_lines)),
         },
     )
