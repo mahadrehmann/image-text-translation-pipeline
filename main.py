@@ -111,6 +111,52 @@ def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFon
     return ImageFont.load_default()
 
 
+def get_text_color_kmeans(region_rgb: np.ndarray) -> tuple[int, int, int]:
+    """
+    Applies K-means (k=2) to the pixels inside a bounding-box crop to find
+    the dominant text color.
+
+    Strategy:
+    - The two clusters represent background and text.
+    - The SMALLER cluster (fewer pixels) is assumed to be the text color,
+      since text covers less area than the background.
+    - Falls back to black or white (brightness-based) if K-means fails.
+
+    Parameters
+    ----------
+    region_rgb : H x W x 3 uint8 numpy array (RGB)
+
+    Returns
+    -------
+    (R, G, B) tuple for the text color.
+    """
+    try:
+        pixels = region_rgb.reshape(-1, 3).astype(np.float32)
+
+        if len(pixels) < 2:
+            raise ValueError("Region too small")
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, centers = cv2.kmeans(
+            pixels, 2, None, criteria,
+            attempts=3, flags=cv2.KMEANS_RANDOM_CENTERS
+        )
+
+        labels = labels.flatten()
+        count0 = int(np.sum(labels == 0))
+        count1 = int(np.sum(labels == 1))
+
+        # Text cluster = the minority cluster
+        text_cluster = 0 if count0 < count1 else 1
+        color = centers[text_cluster].astype(int)
+        return (int(color[0]), int(color[1]), int(color[2]))
+
+    except Exception:
+        # Fallback: black on light backgrounds, white on dark
+        brightness = float(region_rgb.mean())
+        return (0, 0, 0) if brightness > 128 else (255, 255, 255)
+
+
 def estimate_font_size(box_h: int, scale: float = 0.72) -> int:
     """
     Estimates the original font size from the bounding-box height.
@@ -285,14 +331,16 @@ def draw_translated_lines(
     pil_img: Image.Image,
     merged_lines: list[dict],
     translations: list[str],
+    original_img_array: np.ndarray,
 ) -> Image.Image:
     """
     Renders each translated line string into the line's merged bounding box.
     - Font sizes are estimated from bbox heights then clustered to eliminate
       EasyOCR jitter — lines of similar original size render identically.
-    - Paragraph lines (close vertical neighbors) are left-aligned.
+    - Paragraph lines (close x_min neighbors) are left-aligned.
     - Isolated lines (headlines, labels) are center-aligned.
-    - Color is black or white based on background brightness.
+    - Text color is detected via K-means on the ORIGINAL (pre-inpaint) crop
+      so the real text color is used, not the inpainted background.
     """
     draw = ImageDraw.Draw(pil_img)
 
@@ -331,9 +379,9 @@ def draw_translated_lines(
 
         y = y_min + (box_h - th) // 2  # always vertically centered
 
-        # Black or white text based on background brightness
-        region = np.array(pil_img.crop((x_min, y_min, x_max, y_max)))
-        text_color = (0, 0, 0) if region.mean() > 128 else (255, 255, 255)
+        # K-means color detection on the ORIGINAL image crop (before inpainting)
+        region = original_img_array[y_min:y_max, x_min:x_max]
+        text_color = get_text_color_kmeans(region)
 
         draw.text((x, y), translated, font=font, fill=text_color)
 
@@ -428,7 +476,7 @@ async def process_image(image: UploadFile = File(...)):
     try:
         inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
         result_pil = Image.fromarray(inpainted_rgb)
-        result_pil = draw_translated_lines(result_pil, merged_lines, translations)
+        result_pil = draw_translated_lines(result_pil, merged_lines, translations, img_array)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Text rendering failed: {e}"})
 
