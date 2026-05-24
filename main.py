@@ -236,6 +236,51 @@ def merge_detections_into_lines(
     return merged_lines
 
 
+def is_paragraph_line(
+    idx: int,
+    merged_lines: list[dict],
+    x_threshold: int = 30,
+    vertical_scan_factor: float = 5.0,
+) -> bool:
+    """
+    Returns True if the line at `idx` has a vertically nearby neighbor
+    (above or below) whose x_min is within `x_threshold` pixels.
+
+    Logic:
+    - In a paragraph, lines start from the same left margin → x_min values
+      are close → classify as paragraph → left-align.
+    - In a centred poster, each line has a different width and is centred
+      independently → x_min values differ per line → classify as isolated
+      → center-align.
+
+    Only neighbors within `vertical_scan_factor × line_height` are considered
+    so we don't compare against lines from a completely different section.
+    """
+    bb = merged_lines[idx]["bounding_box"]
+    x_min_curr = bb["x_min"]
+    y_min, y_max = bb["y_min"], bb["y_max"]
+    line_h = max(1, y_max - y_min)
+    v_window = vertical_scan_factor * line_h
+
+    for j, other in enumerate(merged_lines):
+        if j == idx:
+            continue
+        obb = other["bounding_box"]
+
+        # Only look at vertically nearby lines
+        gap_below = obb["y_min"] - y_max
+        gap_above = y_min - obb["y_max"]
+        is_nearby = (0 <= gap_below <= v_window) or (0 <= gap_above <= v_window)
+        if not is_nearby:
+            continue
+
+        # If x_min values are close → paragraph
+        if abs(obb["x_min"] - x_min_curr) <= x_threshold:
+            return True
+
+    return False
+
+
 def draw_translated_lines(
     pil_img: Image.Image,
     merged_lines: list[dict],
@@ -245,7 +290,8 @@ def draw_translated_lines(
     Renders each translated line string into the line's merged bounding box.
     - Font sizes are estimated from bbox heights then clustered to eliminate
       EasyOCR jitter — lines of similar original size render identically.
-    - Text is left-aligned with a small horizontal padding.
+    - Paragraph lines (close vertical neighbors) are left-aligned.
+    - Isolated lines (headlines, labels) are center-aligned.
     - Color is black or white based on background brightness.
     """
     draw = ImageDraw.Draw(pil_img)
@@ -258,7 +304,7 @@ def draw_translated_lines(
     raw_sizes    = [estimate_font_size(h) for h in box_heights]
     stable_sizes = cluster_font_sizes(raw_sizes)
 
-    for line, translated, font_size in zip(merged_lines, translations, stable_sizes):
+    for idx, (line, translated, font_size) in enumerate(zip(merged_lines, translations, stable_sizes)):
         if not translated.strip():
             continue
 
@@ -273,12 +319,17 @@ def draw_translated_lines(
 
         font = get_font(font_size)
 
-        # Vertically center; left-align with small padding
         tbbox = draw.textbbox((0, 0), translated, font=font)
         tw, th = tbbox[2] - tbbox[0], tbbox[3] - tbbox[1]
-        padding = max(2, int(box_h * 0.05))
-        x = x_min + padding
-        y = y_min + (box_h - th) // 2
+
+        # Paragraph lines → left-align; isolated lines → center-align
+        if is_paragraph_line(idx, merged_lines):
+            padding = max(4, int(box_h * 0.05))
+            x = x_min + padding
+        else:
+            x = x_min + (box_w - tw) // 2
+
+        y = y_min + (box_h - th) // 2  # always vertically centered
 
         # Black or white text based on background brightness
         region = np.array(pil_img.crop((x_min, y_min, x_max, y_max)))
