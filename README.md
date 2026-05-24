@@ -42,6 +42,36 @@ API docs available at: `http://127.0.0.1:8000/docs`
 
 ---
 
+## Running with Docker
+
+```bash
+# Build the image
+docker build -t image-translation-pipeline .
+
+# Run — recommended: pass .env at runtime so the key is never baked into the image
+docker run --env-file .env -p 8000:8000 image-translation-pipeline
+```
+
+Alternative ways to inject `GEMINI_API_KEY`:
+
+```bash
+# Mount .env as a volume
+docker run -v $(pwd)/.env:/app/.env -p 8000:8000 image-translation-pipeline
+
+# Pass the key directly (one-off)
+docker run -e GEMINI_API_KEY=your_key_here -p 8000:8000 image-translation-pipeline
+```
+
+> **Note:** The `images/` folder is copied into the container at build time, so `POST /batch-process` works out of the box. Reconstructed images are written to `/app/reconstructed-images/` inside the container — mount a volume if you want them on the host:
+> ```bash
+> docker run --env-file .env \
+>   -v $(pwd)/reconstructed-images:/app/reconstructed-images \
+>   -p 8000:8000 image-translation-pipeline
+> ```
+
+---
+
+
 ## Example Requests
 
 ### Single image (returns reconstructed PNG)
